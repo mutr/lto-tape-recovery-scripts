@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Experimental read-only recovery of Yosemite F700/OHDR backup objects.
+
+A capture may begin mid-object. Tape mode reads fixed 65536-byte physical records
+from /dev/nst0 (device is NEVER opened for writing). This parser is based on a
+small observed sample; retain original media and audit recovered data.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import struct
+import subprocess
+import sys
+
+HEADER=64
+BLOCK=65536
+MAX_DATA=16*1024*1024
+MAGIC=b'F700'
+ANCHOR=b'Yosemite Server Backup Storage Domain\x00'
+PATH_MARKER=re.compile(rb'([\x01\x02\x03])\x06\x00\x00([\x01\x05])\x00\x00\x00')
+
+
+def u32(buf,off): return struct.unpack_from('<I',buf,off)[0]
+
+def parse_header(buf,at=0):
+    if len(buf)-at<HEADER or buf[at:at+4]!=MAGIC: return None
+    h=buf[at:at+HEADER]
+    if h[8:12]!=b'OHDR' or h[16:20] not in (b'OBGN',b'OEND',b'DATU'): return None
+    size=u32(h,0x24)
+    if size>MAX_DATA or size!=u32(h,0x28): return None
+    if h[16:20]!=b'DATU' and size: return None
+    if h[16:20]==b'DATU' and u32(h,0x14) not in (0,1): return None
+    return {'seq':u32(h,4),'kind':h[16:20].decode(), 'flag':u32(h,0x14),
+            'size':size,'logical':u32(h,0x2c)}
+
+
+def extract_path(meta):
+    anchor=meta.find(ANCHOR)
+    if anchor<0: return None
+    items=[]
+    for m in PATH_MARKER.finditer(meta,anchor+len(ANCHOR)):
+        start=m.end(); end=meta.find(b'\0',start)
+        if end<0 or not 0<end-start<=512: continue
+        try: name=meta[start:end].decode('utf-8','strict')
+        except UnicodeError: continue
+        if not name or any(ord(ch)<32 for ch in name): continue
+        items.append((m.group(1)[0],name))
+    # Require one named volume and final entry type to be file/dir.
+    if not items or items[0][0]!=1 or items[-1][0] not in (2,3): return None
+    return items
+
+
+def short_name(meta,seq):
+    # Offset 0x28 is UTF-16LE length for the sampled short-name variant.
+    fallback=f'object-{seq:08d}.bin'
+    if len(meta)<0x30: return fallback
+    n=u32(meta,0x28)
+    if n>=2 and n<=1024 and n%2==0 and 0x2c+n<=len(meta):
+        try:
+            name=meta[0x2c:0x2c+n].decode('utf-16le').rstrip('\0')
+            if name and all(ch.isprintable() for ch in name): return name
+        except UnicodeError: pass
+    return fallback
+
+
+def safe_part(name, volume=False):
+    # Avoid path traversal, NUL, reserved path separators and control chars.
+    if volume and re.fullmatch(r'[A-Za-z]:',name): return name[0].upper()
+    if not name or name in ('.','..') or '/' in name or '\\' in name or '\0' in name:
+        raise ValueError(f'unsafe path component: {name!r}')
+    if any(ord(ch)<32 or ord(ch)==127 for ch in name): raise ValueError('control character in path')
+    if len(name.encode('utf-8'))>240: raise ValueError('path component too long')
+    return name
+
+
+def safe_mkdir_tree(root, parts):
+    current=root
+    for part in parts:
+        current=current/part
+        if current.is_symlink(): raise ValueError(f'symlink in output path: {current}')
+        if current.exists():
+            if not current.is_dir(): raise ValueError(f'not a directory: {current}')
+        else: current.mkdir(mode=0o700)
+    return current
+
+
+class Recovery:
+    def __init__(self,out,emit,resume=False):
+        self.out=out; self.emit=emit; self.resume=resume; self.state=None; self.prev_seq=None
+        self.errors=0; self.committed=0; self.dirs=0; self.objects=0
+        safe_mkdir_tree(out,[])
+        safe_mkdir_tree(out,['.partial'])
+
+    def log(self,event,**kw): self.emit(dict(event=event,**kw))
+
+    def fail_current(self,reason):
+        s=self.state
+        if s is None: return
+        if s['file'] is not None:
+            s['file'].close()
+        self.log('incomplete',begin_seq=s['seq'],name=s['name'],reason=reason,
+                 temporary=str(s['tmp']) if s['tmp'] else None)
+        self.errors+=1; self.state=None
+
+    def handle(self,r,payload):
+        seq=r['seq']
+        if self.prev_seq is not None and seq!=(self.prev_seq+1)&0xffffffff:
+            self.fail_current(f'sequence gap {self.prev_seq}->{seq}')
+            self.log('sequence_gap',previous=self.prev_seq,current=seq)
+        self.prev_seq=seq
+        kind=r['kind']
+        if kind=='OBGN':
+            self.fail_current('new OBGN before OEND')
+            self.objects+=1
+            self.state=dict(seq=seq,name=short_name(b'',seq),items=None,metadata=False,
+                            is_dir=False,data=False,total=0,file=None,tmp=None,next_logical=0,dir_aux_records=0,dir_aux_bytes=0,short_acl=None)
+            self.log('begin',seq=seq)
+        elif kind=='DATU':
+            s=self.state
+            if s is None: return
+            if r['flag']==0:
+                if s['data']:
+                    self.fail_current('metadata after content'); return
+                s['metadata']=True
+                s['items']=extract_path(payload)
+                s['name']=s['items'][-1][1] if s['items'] else short_name(payload,s['seq'])
+                s['is_dir']=bool(s['items'] and s['items'][-1][0]==2)
+                self.log('metadata',begin_seq=s['seq'],name=s['name'],
+                         path='/'.join(x[1] for x in s['items']) if s['items'] else None,
+                         object_type='directory' if s['is_dir'] else 'file',size=r['size'])
+            else:
+                if not s['metadata']:
+                    self.fail_current('data before metadata'); return
+                if s['is_dir']:
+                    # Observed Yosemite directory objects have an auxiliary DATU
+                    # even though OEND logical size is zero. Do not materialize it.
+                    # Bound its size to avoid silently discarding real file data.
+                    if r['size'] > 4096 or r['logical'] != 0:
+                        self.fail_current(f'unexpected directory auxiliary DATU: size={r["size"]}, logical={r["logical"]}'); return
+                    s['dir_aux_records'] += 1
+                    s['dir_aux_bytes'] += r['size']
+                    return
+                if not s['data']:
+                    # Observed zero-length file: a 220-byte Windows security
+                    # descriptor DATU with no data bytes. Defer validation until
+                    # OEND confirms that the logical file size is exactly zero.
+                    if (len(payload)==220 and r['logical']==0 and
+                        payload[:12]==bytes.fromhex('0300000002000000c8000000')):
+                        s['short_acl']=payload
+                        return
+                    if s['short_acl'] is not None:
+                        self.fail_current('additional content after short ACL DATU'); return
+                    if len(payload)<240 or r['logical']!=0:
+                        self.fail_current('invalid first data prefix or logical offset'); return
+                    tmp=self.out/'.partial'/f'{s["seq"]:08d}.part'
+                    if tmp.exists() or tmp.is_symlink():
+                        if (self.resume and tmp.is_file() and not tmp.is_symlink()):
+                            # A prior session can stop inside an object. Replay
+                            # from its preceding completed-object checkpoint.
+                            tmp.unlink()
+                            self.log('partial_restarted',begin_seq=s['seq'],path=str(tmp))
+                        else:
+                            self.fail_current(f'partial already exists: {tmp}'); return
+                    s['tmp']=tmp; s['file']=tmp.open('xb'); s['data']=True
+                    chunk=payload[240:]
+                else:
+                    if r['logical']!=s['next_logical']:
+                        self.fail_current(f'logical mismatch: expected {s["next_logical"]}, got {r["logical"]}')
+                        return
+                    chunk=payload
+                s['file'].write(chunk)
+                s['total']+=len(chunk)
+                # Yosemite logical offset is measured in bytes of DATU, not of file.
+                s['next_logical']+=r['size']
+        elif kind=='OEND':
+            s=self.state
+            if s is None: return
+            size=r['logical']
+            if s['is_dir'] and size==0 and not s['data']:
+                if not s['items']:
+                    self.fail_current('directory without full path'); return
+                try:
+                    parts=[safe_part(name,volume=(i==0)) for i,(_,name) in enumerate(s['items'])]
+                    directory=safe_mkdir_tree(self.out,parts)
+                except ValueError as e:
+                    self.fail_current(str(e)); return
+                self.dirs+=1
+                self.log('directory',begin_seq=s['seq'],end_seq=seq,path=str(directory),
+                         auxiliary_records=s['dir_aux_records'], auxiliary_bytes=s['dir_aux_bytes'])
+                self.state=None; return
+            if not s['data']:
+                if s['short_acl'] is None or size!=0:
+                    self.fail_current('OEND without content or inconsistent short ACL record'); return
+                tmp=self.out/'.partial'/f'{s["seq"]:08d}.part'
+                if tmp.exists() or tmp.is_symlink():
+                    if self.resume and tmp.is_file() and not tmp.is_symlink():
+                        tmp.unlink()
+                        self.log('partial_restarted',begin_seq=s['seq'],path=str(tmp))
+                    else:
+                        self.fail_current(f'partial already exists: {tmp}'); return
+                s['tmp']=tmp
+                s['file']=tmp.open('xb')
+                s['data']=True
+                s['total']=0
+                self.log('empty_file_acl',begin_seq=s['seq'],auxiliary_bytes=len(s['short_acl']))
+            if size>s['total'] or s['total']-size>4096:
+                self.fail_current(f'OEND size {size} does not match captured {s["total"]}'); return
+            excess=s['total']-size
+            s['file'].truncate(size)
+            s['file'].flush(); os.fsync(s['file'].fileno()); s['file'].close(); s['file']=None
+            try:
+                if s['items']:
+                    parts=[safe_part(name,volume=(i==0)) for i,(_,name) in enumerate(s['items'])]
+                    if s['items'][-1][0]!=3: raise ValueError('non-file metadata for file data')
+                    parent=safe_mkdir_tree(self.out,parts[:-1])
+                    target=parent/parts[-1]
+                else:
+                    target=self.out/f'{s["seq"]:08d}_{safe_part(s["name"])}'
+                if target.exists() or target.is_symlink():
+                    raise ValueError(f'target already exists: {target}')
+                # Hardlink-safe destination (no overwrite); rename confined under output.
+                os.link(s['tmp'],target,follow_symlinks=False)
+                s['tmp'].unlink()
+            except (ValueError,OSError) as e:
+                self.fail_current(f'could not commit: {e}'); return
+            self.committed+=1
+            if s['short_acl'] is not None:
+                metadata_dir=safe_mkdir_tree(self.out,['.metadata'])
+                raw_acl=metadata_dir/f'{s["seq"]:08d}.security.bin'
+                try:
+                    with raw_acl.open('xb') as raw:
+                        raw.write(s['short_acl'])
+                        raw.flush(); os.fsync(raw.fileno())
+                    self.log('security_metadata',begin_seq=s['seq'],path=str(raw_acl),
+                             bytes=len(s['short_acl']),sha256=hashlib.sha256(s['short_acl']).hexdigest())
+                except OSError as e:
+                    self.log('warning',begin_seq=s['seq'],reason=f'could not save raw security metadata: {e}')
+            h=hashlib.sha256()
+            with target.open('rb') as f:
+                for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+            self.log('restored',begin_seq=s['seq'],end_seq=seq,path=str(target),
+                     name=s['name'],bytes=size,trailer_bytes=excess,sha256=h.hexdigest())
+            self.state=None
+
+
+
+class CatalogRecovery:
+    """Metadata-only Yosemite index. Never writes archive file contents."""
+    def __init__(self, out, emit, source, resume=False):
+        self.out=out; self.emit=emit; self.source=source; self.resume=resume
+        self.prev_seq=None; self.state=None; self.errors=0
+        self.committed=0; self.dirs=0; self.objects=0
+        self.db=sqlite3.connect(str(out/'catalog.sqlite3'))
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA synchronous=FULL')
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS objects (
+          begin_seq INTEGER PRIMARY KEY, end_seq INTEGER NOT NULL,
+          kind TEXT NOT NULL, original_path TEXT NOT NULL, relative_path TEXT,
+          size INTEGER NOT NULL, begin_offset INTEGER NOT NULL,
+          metadata_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL,
+          source TEXT NOT NULL, status TEXT NOT NULL,
+          content_records INTEGER NOT NULL,
+          comment TEXT
+        );
+        CREATE TABLE IF NOT EXISTS records (
+          seq INTEGER PRIMARY KEY, object_begin_seq INTEGER NOT NULL,
+          byte_offset INTEGER NOT NULL, physical_block INTEGER NOT NULL,
+          offset_in_block INTEGER NOT NULL, kind TEXT NOT NULL,
+          flag INTEGER NOT NULL, payload_size INTEGER NOT NULL,
+          logical INTEGER NOT NULL,
+          FOREIGN KEY(object_begin_seq) REFERENCES objects(begin_seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_records_object ON records(object_begin_seq);
+        """)
+        self.db.commit()
+
+    def log(self,event,**kw): self.emit(dict(event=event,**kw))
+
+    def fail_current(self, reason):
+        s=self.state
+        if s is None: return
+        self.log('incomplete',begin_seq=s['seq'],name=s['name'],reason=reason,temporary=None)
+        self.errors+=1; self.state=None
+
+    def handle(self,r,payload,byte_offset):
+        seq=r['seq']
+        if self.prev_seq is not None and seq != ((self.prev_seq+1)&0xffffffff):
+            self.fail_current(f'sequence gap {self.prev_seq}->{seq}')
+            self.log('sequence_gap',previous=self.prev_seq,current=seq)
+        self.prev_seq=seq
+        kind=r['kind']
+        if kind=='OBGN':
+            self.fail_current('new OBGN before OEND')
+            self.objects+=1
+            self.state=dict(seq=seq,name=f'object-{seq:08d}',items=None,
+                 begin=byte_offset,meta_offset=None,records=[],content=0,first=True,
+                 data_bytes=0,short_acl=False, invalid=None)
+            self.log('begin',seq=seq)
+        s=self.state
+        if s is None: return
+        s['records'].append((seq,s['seq'],byte_offset,byte_offset//BLOCK,
+                             byte_offset%BLOCK,kind,r['flag'],r['size'],r['logical']))
+        if kind=='DATU':
+            if r['flag']==0:
+                if s['items'] is not None:
+                    s['invalid']='duplicate metadata DATU'
+                else:
+                    s['meta_offset']=byte_offset
+                    s['items']=extract_path(payload)
+                    s['name']=s['items'][-1][1] if s['items'] else short_name(payload,s['seq'])
+                    self.log('metadata',begin_seq=s['seq'],name=s['name'],
+                             path='/'.join(x[1] for x in s['items']) if s['items'] else None,
+                             object_type=('directory' if s['items'] and s['items'][-1][0]==2 else 'file'),size=r['size'])
+            else:
+                s['content']+=1
+                is_dir=bool(s['items'] and s['items'][-1][0]==2)
+                if not is_dir:
+                    if s['first']:
+                        if len(payload)==220 and r['logical']==0 and payload[:12]==bytes.fromhex('0300000002000000c8000000'):
+                            s['short_acl']=True
+                        elif len(payload)>=240 and r['logical']==0:
+                            s['data_bytes']+=len(payload)-240
+                        else:
+                            s['invalid']=f'invalid initial DATU: size={len(payload)}, logical={r["logical"]}'
+                        s['first']=False
+                    elif s['short_acl']:
+                        s['invalid']='unexpected DATU after 220-byte ACL'
+                    else:
+                        s['data_bytes']+=len(payload)
+        elif kind=='OEND':
+            if not s['items']:
+                self.fail_current('missing full path metadata'); return
+            is_dir=s['items'][-1][0]==2
+            expected=r['logical']
+            if s['invalid']:
+                self.fail_current(s['invalid']); return
+            if is_dir and expected!=0:
+                self.fail_current('directory with nonzero logical size'); return
+            if not is_dir and (s['content']==0 or s['short_acl'] and expected!=0 or
+                               not s['short_acl'] and (expected>s['data_bytes'] or s['data_bytes']-expected>4096)):
+                self.fail_current(f'inconsistent size: expected={expected}, observed={s["data_bytes"]}'); return
+            try:
+                parts=[safe_part(name,volume=(i==0)) for i,(_,name) in enumerate(s['items'])]
+                rel='/'.join(parts)
+                parent=safe_mkdir_tree(self.out,parts if is_dir else parts[:-1])
+                status='directory' if is_dir else 'placeholder'
+                if not is_dir:
+                    target=parent/parts[-1]
+                    if target.exists() or target.is_symlink():
+                        # Do not mistake an existing real zero-byte file for a placeholder.
+                        known=self.db.execute('SELECT begin_seq FROM objects WHERE relative_path=?',(rel,)).fetchone()
+                        if known is None:
+                            status='name_conflict'
+                        elif known[0]!=s['seq']:
+                            status='name_conflict'
+                    else:
+                        with target.open('xb'): pass
+                self.db.execute('BEGIN')
+                self.db.execute("""INSERT OR REPLACE INTO objects
+                    (begin_seq,end_seq,kind,original_path,relative_path,size,begin_offset,
+                     metadata_offset,end_offset,source,status,content_records,comment)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (s['seq'],seq,'directory' if is_dir else 'file',
+                     '/'.join(x[1] for x in s['items']), rel, expected,s['begin'],
+                     s['meta_offset'],byte_offset,self.source,status,s['content'],
+                     '220-byte ACL-only DATU' if s['short_acl'] else None))
+                self.db.executemany("""INSERT OR REPLACE INTO records
+                   (seq,object_begin_seq,byte_offset,physical_block,offset_in_block,
+                    kind,flag,payload_size,logical) VALUES (?,?,?,?,?,?,?,?,?)""",s['records'])
+                self.db.commit()
+            except (ValueError,OSError,sqlite3.Error) as e:
+                self.db.rollback()
+                self.fail_current(f'catalog commit failed: {e}'); return
+            if is_dir:
+                self.dirs+=1
+                self.log('directory',begin_seq=s['seq'],end_seq=seq,path=str(self.out/rel),auxiliary_records=s['content'])
+            else:
+                self.committed+=1
+                self.log('cataloged',begin_seq=s['seq'],end_seq=seq,path=str(self.out/rel),
+                         bytes=expected,placeholder=(status=='placeholder'),status=status)
+            self.state=None
+
+    def close(self): self.db.close()
+
+def log_emitter(log):
+    def emit(event):
+        log.write(json.dumps(event,ensure_ascii=False)+'\n'); log.flush()
+    return emit
+
+
+def checkpoint_write(path,source,base,prev_seq,stats,mode="restore"):
+    tmp=path.with_suffix('.tmp')
+    obj=dict(version=1,mode=mode,source=source,byte_offset=base,physical_block=base//BLOCK,
+             offset_in_block=base%BLOCK,previous_seq=prev_seq,stats=stats)
+    with tmp.open('w') as f:
+        json.dump(obj,f,indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,path)
+
+
+def source_blocks(args,offset):
+    # Returns chunks read; single reader, no offset assumptions inside physical record.
+    if args.tape:
+        if offset:
+            block=offset//BLOCK
+            subprocess.run(['mt','-f',args.tape,'rewind'],check=True)
+            subprocess.run(['mt','-f',args.tape,'fsr',str(block)],check=True)
+        else:
+            subprocess.run(['mt','-f',args.tape,'rewind'],check=True)
+        fd=os.open(args.tape,os.O_RDONLY | getattr(os,'O_CLOEXEC',0))
+        try:
+            count=0
+            while count<args.max_blocks:
+                chunk=os.read(fd,BLOCK)
+                if not chunk: break  # filemark/EOD; do not cross automatically
+                if len(chunk)!=BLOCK:
+                    raise IOError(f'Unexpected physical record size {len(chunk)} (expected {BLOCK})')
+                count+=1
+                yield chunk
+        finally: os.close(fd)
+    else:
+        with args.input.open('rb') as f:
+            f.seek(offset//BLOCK*BLOCK)
+            while True:
+                chunk=f.read(4*1024*1024)
+                if not chunk: break
+                yield chunk
+
+
+def recover(args):
+    out=args.out
+    out.mkdir(parents=True,exist_ok=True)
+    checkpoint=out/'checkpoint.json'
+    logpath=out/'recovery.jsonl'
+    source=args.tape if args.tape else str(args.input.resolve())
+    offset=0; previous=None
+    if args.resume:
+        c=json.loads(checkpoint.read_text())
+        if c.get('mode','restore') != ('catalog' if args.catalog_only else 'restore'):
+            raise ValueError('checkpoint mode mismatch (--catalog-only)')
+        if c['source']!=source: raise ValueError('checkpoint belongs to another source')
+        offset=c['byte_offset']; previous=c['previous_seq']
+        if args.tape and offset%BLOCK and not args.tape.startswith('/dev/nst'):
+            raise ValueError('use the non-rewinding tape device /dev/nst*')
+    elif checkpoint.exists() or logpath.exists():
+        raise FileExistsError('output already has a journal/checkpoint; choose new --out or --resume')
+    if args.resume and offset==0 and previous is None:
+        raise ValueError('no completed object checkpoint to resume from')
+    if args.tape and args.max_blocks<=0: raise ValueError('--max-blocks must be positive')
+    with logpath.open('a' if args.resume else 'x',encoding='utf-8') as logfile:
+        rec=(CatalogRecovery(out,log_emitter(logfile),source,resume=args.resume) if args.catalog_only
+             else Recovery(out,log_emitter(logfile),resume=args.resume)); rec.prev_seq=previous
+        rec.log('session',source=source,resume=args.resume,offset=offset)
+        buf=bytearray(); base=offset//BLOCK*BLOCK; eof=False; aligned=False; skipped=offset%BLOCK
+        iterator=iter(source_blocks(args,offset))
+        try:
+            while True:
+                if not eof and len(buf)<MAX_DATA+HEADER+BLOCK:
+                    try: chunk=next(iterator)
+                    except StopIteration: eof=True
+                    else:
+                        if skipped:
+                            chunk=chunk[skipped:]; base+=skipped; skipped=0
+                        buf.extend(chunk)
+                if not aligned:
+                    idx=buf.find(MAGIC)
+                    if idx<0:
+                        if eof: break
+                        discard=max(0,len(buf)-HEADER)
+                        del buf[:discard]; base+=discard; continue
+                    if len(buf)-idx<HEADER:
+                        if eof: break
+                        del buf[:idx]; base+=idx; continue
+                    r=parse_header(buf,idx)
+                    if r is None:
+                        del buf[:idx+1]; base+=idx+1; continue
+                    del buf[:idx]; base+=idx; aligned=True
+                r=parse_header(buf)
+                if r is None:
+                    rec.fail_current(f'invalid header at source offset {base}')
+                    aligned=False; del buf[0:1]; base+=1; continue
+                needed=HEADER+((r['size']+63)//64)*64
+                if len(buf)<needed:
+                    if eof:
+                        rec.fail_current(f'truncated record at byte {base}'); break
+                    continue
+                prev_completed=rec.committed+rec.dirs
+                if args.catalog_only:
+                    rec.handle(r,bytes(buf[HEADER:HEADER+r['size']]),base)
+                else:
+                    rec.handle(r,bytes(buf[HEADER:HEADER+r['size']]))
+                del buf[:needed]; base+=needed
+                if rec.committed+rec.dirs>prev_completed and rec.state is None:
+                    checkpoint_write(checkpoint,source,base,rec.prev_seq,
+                                     {'restored_this_run':rec.committed,'directories_this_run':rec.dirs},
+                                     mode='catalog' if args.catalog_only else 'restore')
+            rec.fail_current('end of captured range before OEND')
+            rec.log('summary',objects_started=rec.objects,restored=rec.committed,
+                    directories=rec.dirs,incomplete=rec.errors,mode='catalog' if args.catalog_only else 'restore')
+            return rec.committed,rec.errors
+        finally:
+            if args.catalog_only: rec.close()
+            close=getattr(iterator,'close',None)
+            if close: close()
+
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    group=ap.add_mutually_exclusive_group(required=True)
+    group.add_argument('--input',type=Path,help='captured binary file')
+    group.add_argument('--tape',help='non-rewinding tape, e.g. /dev/nst0')
+    ap.add_argument('--out',required=True,type=Path)
+    ap.add_argument('--resume',action='store_true',help='resume at last completed object checkpoint')
+    ap.add_argument('--catalog-only',action='store_true',help='create empty placeholder files and SQLite tape index, no payload extraction')
+    ap.add_argument('--max-blocks',type=int,default=4096,help='maximum 64KiB tape records per session (default 4096)')
+    args=ap.parse_args()
+    if args.tape and args.tape!='/dev/nst0' and not re.fullmatch(r'/dev/nst\d+',args.tape):
+        ap.error('tape must be /dev/nstN (not /dev/stN)')
+    if args.input and not args.input.is_file(): ap.error('missing capture file')
+    try:
+        restored,failed=recover(args)
+        print(f'{"Cataloged" if args.catalog_only else "Restored"} {restored} files, incomplete/failed {failed}. Log: {args.out}/recovery.jsonl')
+    except (ValueError,FileExistsError,OSError,subprocess.CalledProcessError) as e:
+        ap.exit(2,f'ERROR: {e}\n')
+
+if __name__=='__main__': main()
