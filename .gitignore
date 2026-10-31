@@ -17,3 +17,6 @@ manifest.json
 # Restored data
 catalog/
 restored/
+
+/*L[0-9]/
+/tape-inventory.sqlite3*

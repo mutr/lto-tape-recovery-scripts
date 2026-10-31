@@ -256,6 +256,7 @@ class CatalogRecovery:
         self.out=out; self.emit=emit; self.source=source; self.resume=resume
         self.prev_seq=None; self.state=None; self.errors=0
         self.committed=0; self.dirs=0; self.objects=0
+        self.inflight_saved_count=0
         self.db=sqlite3.connect(str(out/'catalog.sqlite3'))
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
@@ -278,6 +279,28 @@ class CatalogRecovery:
           FOREIGN KEY(object_begin_seq) REFERENCES objects(begin_seq)
         );
         CREATE INDEX IF NOT EXISTS idx_records_object ON records(object_begin_seq);
+        CREATE TABLE IF NOT EXISTS inflight_records (
+            object_begin_seq INTEGER NOT NULL,
+            record_idx INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
+            object_seq INTEGER NOT NULL,
+            byte_offset INTEGER NOT NULL,
+            physical_block INTEGER NOT NULL,
+            offset_in_block INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            flag INTEGER NOT NULL,
+            payload_size INTEGER NOT NULL,
+            logical INTEGER NOT NULL,
+            PRIMARY KEY(object_begin_seq,record_idx)
+        );
+        CREATE TABLE IF NOT EXISTS inflight_snapshots (
+            id INTEGER PRIMARY KEY,
+            object_begin_seq INTEGER NOT NULL,
+            record_count INTEGER NOT NULL,
+            byte_offset INTEGER NOT NULL,
+            previous_seq INTEGER NOT NULL,
+            state_json TEXT NOT NULL
+        );
         """)
         self.db.commit()
 
@@ -298,6 +321,7 @@ class CatalogRecovery:
         kind=r['kind']
         if kind=='OBGN':
             self.fail_current('new OBGN before OEND')
+            self.inflight_saved_count=0
             self.objects+=1
             self.state=dict(seq=seq,name=f'object-{seq:08d}',items=None,
                  begin=byte_offset,meta_offset=None,records=[],content=0,first=True,
@@ -335,57 +359,195 @@ class CatalogRecovery:
                     else:
                         s['data_bytes']+=len(payload)
         elif kind=='OEND':
+            # A well-formed OEND is sufficient to index the object's position,
+            # even if its content framing or declared length is not understood.
             if not s['items']:
                 self.fail_current('missing full path metadata'); return
             is_dir=s['items'][-1][0]==2
-            expected=r['logical']
-            if s['invalid']:
-                self.fail_current(s['invalid']); return
+            expected=r['logical']  # only the low 32 bits; never a verified >4GiB size
+            reasons=[]
+            if s['invalid']: reasons.append(s['invalid'])
             if is_dir and expected!=0:
-                self.fail_current('directory with nonzero logical size'); return
-            if not is_dir and (s['content']==0 or s['short_acl'] and expected!=0 or
-                               not s['short_acl'] and (expected>s['data_bytes'] or s['data_bytes']-expected>4096)):
-                self.fail_current(f'inconsistent size: expected={expected}, observed={s["data_bytes"]}'); return
-            try:
-                parts=[safe_part(name,volume=(i==0)) for i,(_,name) in enumerate(s['items'])]
+                reasons.append('directory with nonzero logical size')
+            size_delta=expected-s['data_bytes']
+            size_variant_12=(not is_dir and not s['short_acl'] and
+                             s['content']>0 and size_delta==12)
+            if size_variant_12:
+                self.log('size_variant_12',begin_seq=s['seq'],expected=expected,
+                         observed=s['data_bytes'],note='unverified 12-byte DATU overhead variant')
+            if not is_dir:
+                if s['content']==0:
+                    reasons.append('OEND without content')
+                elif s['short_acl'] and expected!=0:
+                    reasons.append('short ACL with nonzero OEND')
+                elif not s['short_acl'] and not size_variant_12 and (
+                        expected>s['data_bytes'] or s['data_bytes']-expected>4096):
+                    reasons.append(f'inconsistent size: expected={expected}, observed={s["data_bytes"]}')
+
+            # Preserve original path in the database even if an OS filename
+            # cannot be materialized (e.g., components > 240 UTF-8 bytes).
+            original='/'.join(x[1] for x in s['items'])
+            parts=[]
+            path_unsafe=False
+            for i,(_,name) in enumerate(s['items']):
+                try:
+                    parts.append(safe_part(name,volume=(i==0)))
+                except ValueError as exc:
+                    reasons.append(f'path not materialized: {exc}')
+                    path_unsafe=True
+                    break
+            if not path_unsafe:
                 rel='/'.join(parts)
-                parent=safe_mkdir_tree(self.out,parts if is_dir else parts[:-1])
-                status='directory' if is_dir else 'placeholder'
-                if not is_dir:
-                    target=parent/parts[-1]
-                    if target.exists() or target.is_symlink():
-                        # Do not mistake an existing real zero-byte file for a placeholder.
-                        known=self.db.execute('SELECT begin_seq FROM objects WHERE relative_path=?',(rel,)).fetchone()
-                        if known is None:
-                            status='name_conflict'
-                        elif known[0]!=s['seq']:
-                            status='name_conflict'
-                    else:
-                        with target.open('xb'): pass
-                self.db.execute('BEGIN')
-                self.db.execute("""INSERT OR REPLACE INTO objects
-                    (begin_seq,end_seq,kind,original_path,relative_path,size,begin_offset,
-                     metadata_offset,end_offset,source,status,content_records,comment)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (s['seq'],seq,'directory' if is_dir else 'file',
-                     '/'.join(x[1] for x in s['items']), rel, expected,s['begin'],
-                     s['meta_offset'],byte_offset,self.source,status,s['content'],
-                     '220-byte ACL-only DATU' if s['short_acl'] else None))
-                self.db.executemany("""INSERT OR REPLACE INTO records
-                   (seq,object_begin_seq,byte_offset,physical_block,offset_in_block,
-                    kind,flag,payload_size,logical) VALUES (?,?,?,?,?,?,?,?,?)""",s['records'])
-                self.db.commit()
-            except (ValueError,OSError,sqlite3.Error) as e:
-                self.db.rollback()
-                self.fail_current(f'catalog commit failed: {e}'); return
-            if is_dir:
-                self.dirs+=1
-                self.log('directory',begin_seq=s['seq'],end_seq=seq,path=str(self.out/rel),auxiliary_records=s['content'])
             else:
-                self.committed+=1
-                self.log('cataloged',begin_seq=s['seq'],end_seq=seq,path=str(self.out/rel),
-                         bytes=expected,placeholder=(status=='placeholder'),status=status)
+                rel=None
+
+            # For ambiguous records the OEND low32 is NOT a valid full size.
+            # Store measured DATU bytes as an estimate only when >=2^32, and
+            # retain both numbers plus the ambiguity in comment JSON.
+            ambiguous=bool(reasons)
+            observed=s['data_bytes']
+            est_large=(not is_dir and observed>=2**32 and
+                       (observed-expected) % (2**32) <= 4096)
+            if est_large:
+                ambiguous=True
+                reasons.append('OEND logical is 32-bit; full size unverified')
+            stored_size=(observed if est_large else expected)
+            status=('directory' if is_dir else 'unverified' if ambiguous else 'placeholder')
+            if is_dir and ambiguous: status='unverified'
+            comment=None
+            if ambiguous:
+                comment=json.dumps(dict(reasons=reasons, oend_logical32=expected,
+                                        measured_datu_bytes=observed,
+                                        estimated_large_size=est_large,
+                                        materialized=False),ensure_ascii=False)
+            elif s['short_acl']:
+                comment='220-byte ACL-only DATU'
+            elif size_variant_12:
+                comment='UNVERIFIED: 12-byte size discrepancy'
+
+            # Do not manufacture placeholder files for ambiguous data.
+            # Filesystem failures must not prevent metadata indexing.
+            if rel is not None and not ambiguous:
+                try:
+                    parent=safe_mkdir_tree(self.out,parts if is_dir else parts[:-1])
+                    if not is_dir:
+                        target=parent/parts[-1]
+                        if target.exists() or target.is_symlink():
+                            known=self.db.execute('SELECT begin_seq FROM objects WHERE relative_path=?',(rel,)).fetchone()
+                            if known is None or known[0]!=s['seq']:
+                                status='name_conflict'
+                        else:
+                            with target.open('xb'): pass
+                except (ValueError,OSError) as exc:
+                    status='unverified'
+                    reasons.append(f'placeholder not materialized: {exc}')
+                    comment=json.dumps(dict(reasons=reasons,oend_logical32=expected,
+                                            measured_datu_bytes=observed,
+                                            materialized=False),ensure_ascii=False)
+
+            try:
+                with self.db:
+                    self.db.execute('''INSERT OR REPLACE INTO objects
+                        (begin_seq,end_seq,kind,original_path,relative_path,size,begin_offset,
+                         metadata_offset,end_offset,source,status,content_records,comment)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        (s['seq'],seq,'directory' if is_dir else 'file',
+                         original,rel,stored_size,s['begin'],s['meta_offset'],byte_offset,
+                         self.source,status,s['content'],comment))
+                    self.db.executemany('''INSERT OR REPLACE INTO records
+                        (seq,object_begin_seq,byte_offset,physical_block,offset_in_block,
+                         kind,flag,payload_size,logical) VALUES (?,?,?,?,?,?,?,?,?)''',s['records'])
+            except sqlite3.Error as exc:
+                self.fail_current(f'catalog commit failed: {exc}'); return
+
+            if status=='unverified':
+                self.log('cataloged_unverified',begin_seq=s['seq'],end_seq=seq,
+                         path=original,reason='; '.join(reasons),
+                         oend_logical32=expected,measured_datu_bytes=observed,
+                         estimated_large_size=est_large)
+            elif is_dir:
+                self.log('directory',begin_seq=s['seq'],end_seq=seq,
+                         path=str(self.out/rel),auxiliary_records=s['content'])
+            else:
+                self.log('cataloged',begin_seq=s['seq'],end_seq=seq,
+                         path=str(self.out/rel),bytes=stored_size,
+                         placeholder=(status=='placeholder'),status=status)
+            if is_dir: self.dirs+=1
+            else: self.committed+=1
             self.state=None
+
+    def save_inflight(self, state, offset, prev_seq):
+        """Commit SQLite first; checkpoint.json will publish the returned snapshot id.
+
+        Old snapshots remain readable if the process crashes before JSON rename.
+        The record table is append/upsert-only until a completed-object checkpoint.
+        """
+        self.db.execute('''CREATE TABLE IF NOT EXISTS inflight_records (
+            object_begin_seq INTEGER NOT NULL,
+            record_idx INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
+            object_seq INTEGER NOT NULL,
+            byte_offset INTEGER NOT NULL,
+            physical_block INTEGER NOT NULL,
+            offset_in_block INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            flag INTEGER NOT NULL,
+            payload_size INTEGER NOT NULL,
+            logical INTEGER NOT NULL,
+            PRIMARY KEY(object_begin_seq,record_idx)
+        )''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS inflight_snapshots (
+            id INTEGER PRIMARY KEY,
+            object_begin_seq INTEGER NOT NULL,
+            record_count INTEGER NOT NULL,
+            byte_offset INTEGER NOT NULL,
+            previous_seq INTEGER NOT NULL,
+            state_json TEXT NOT NULL
+        )''')
+        begin=state['seq']
+        # rec.state records must not change between SQLite commit and JSON publication.
+        records=state['records']
+        state_meta={k:v for k,v in state.items() if k!='records'}
+        start=self.inflight_saved_count if self.inflight_saved_count<=len(records) else 0
+        with self.db:
+            self.db.executemany('''INSERT OR REPLACE INTO inflight_records
+                (object_begin_seq,record_idx,seq,object_seq,byte_offset,
+                 physical_block,offset_in_block,kind,flag,payload_size,logical)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                ((begin,i,*records[i]) for i in range(start,len(records))))
+            cur=self.db.execute('''INSERT INTO inflight_snapshots
+                (object_begin_seq,record_count,byte_offset,previous_seq,state_json)
+                VALUES (?,?,?,?,?)''',
+                (begin,len(records),offset,prev_seq,json.dumps(state_meta,ensure_ascii=False)))
+            snapshot_id=cur.lastrowid
+        self.inflight_saved_count=len(records)
+        return snapshot_id
+
+    def load_inflight(self, snapshot_id, offset, prev_seq):
+        snap=self.db.execute('''SELECT object_begin_seq,record_count,byte_offset,
+            previous_seq,state_json FROM inflight_snapshots WHERE id=?''',
+            (snapshot_id,)).fetchone()
+        if snap is None or snap[2]!=offset or snap[3]!=prev_seq:
+            raise ValueError('SQLite snapshot does not match checkpoint.json')
+        begin,count=snap[0],snap[1]
+        rows=self.db.execute('''SELECT seq,object_seq,byte_offset,physical_block,
+            offset_in_block,kind,flag,payload_size,logical
+            FROM inflight_records WHERE object_begin_seq=? AND record_idx<?
+            ORDER BY record_idx''',(begin,count)).fetchall()
+        if len(rows)!=count:
+            raise ValueError(f'incomplete SQLite inflight records: {len(rows)} != {count}')
+        state=json.loads(snap[4]);state['records']=[tuple(row) for row in rows]
+        if state['seq']!=begin:
+            raise ValueError('snapshot object identity mismatch')
+        self.inflight_saved_count=count
+        return state
+
+    def clean_inflight(self):
+        # Called only after completed-object checkpoint.json is committed.
+        with self.db:
+            self.db.execute('DELETE FROM inflight_records')
+            self.db.execute('DELETE FROM inflight_snapshots')
+        self.inflight_saved_count=0
 
     def close(self): self.db.close()
 
@@ -395,13 +557,23 @@ def log_emitter(log):
     return emit
 
 
-def checkpoint_write(path,source,base,prev_seq,stats,mode="restore"):
+def checkpoint_write(path,source,base,prev_seq,stats,mode="restore",in_progress=None,catalog_rec=None):
     tmp=path.with_suffix('.tmp')
-    obj=dict(version=1,mode=mode,source=source,byte_offset=base,physical_block=base//BLOCK,
+    obj=dict(version=2,mode=mode,source=source,byte_offset=base,physical_block=base//BLOCK,
              offset_in_block=base%BLOCK,previous_seq=prev_seq,stats=stats)
+    if in_progress is not None:
+        if mode != 'catalog':
+            raise ValueError('in-progress checkpoint is catalog-only')
+        if catalog_rec is None:
+            raise ValueError('catalog recovery required for SQLite inflight checkpoint')
+        obj['in_progress_ref'] = catalog_rec.save_inflight(in_progress,base,prev_seq)
     with tmp.open('w') as f:
         json.dump(obj,f,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,path)
+    # Make renamed checkpoint durable across power loss, where supported.
+    dfd=os.open(str(path.parent),os.O_RDONLY)
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
 
 
 def tape_capacity_snapshot(tape):
@@ -508,6 +680,19 @@ def recover(args):
     with logpath.open('a' if args.resume else 'x',encoding='utf-8') as logfile:
         rec=(CatalogRecovery(out,log_emitter(logfile),source,resume=args.resume) if args.catalog_only
              else Recovery(out,log_emitter(logfile),resume=args.resume)); rec.prev_seq=previous
+        if args.resume and args.catalog_only:
+            if c.get('in_progress_ref') is not None:
+                state=rec.load_inflight(c['in_progress_ref'],offset,previous)
+            else:
+                state=c.get('in_progress')  # Read legacy v1 checkpoints unchanged.
+            if state is not None:
+                if not isinstance(state,dict) or not isinstance(state.get('records'),list):
+                    raise ValueError('invalid in-progress checkpoint')
+                if state.get('seq') is None or state.get('items') is None:
+                    raise ValueError('incomplete in-progress checkpoint')
+                rec.state=state
+                rec.log('object_resumed',begin_seq=state['seq'],
+                        records=len(state['records']),offset=offset)
         rec.log('session',source=source,resume=args.resume,offset=offset)
         buf=bytearray(); base=offset//BLOCK*BLOCK; eof=False; aligned=False; skipped=offset%BLOCK
         stop_reason=None; read_error=None
@@ -546,7 +731,21 @@ def recover(args):
                 needed=HEADER+((r['size']+63)//64)*64
                 if len(buf)<needed:
                     if eof:
-                        rec.fail_current(f'truncated record at byte {base}'); break
+                        # A session limit is not a damaged tape record.
+                        # The next resume must re-read this incomplete record.
+                        if (args.catalog_only and
+                                stop_reason == 'max_blocks_reached'):
+                            rec.log(
+                                'partial_record_deferred',
+                                byte_offset=base,
+                                buffered_bytes=len(buf),
+                                required_bytes=needed
+                            )
+                        else:
+                            rec.fail_current(
+                                f'truncated record at byte {base}'
+                            )
+                        break
                     continue
                 prev_completed=rec.committed+rec.dirs
                 if args.catalog_only:
@@ -558,6 +757,18 @@ def recover(args):
                     checkpoint_write(checkpoint,source,base,rec.prev_seq,
                                      {'restored_this_run':rec.committed,'directories_this_run':rec.dirs},
                                      mode='catalog' if args.catalog_only else 'restore')
+                    if args.catalog_only:
+                        rec.clean_inflight()
+                if (args.catalog_only and rec.state is not None
+                        and len(rec.state['records']) % 1024 == 0):
+                    checkpoint_write(
+                        checkpoint, source, base, rec.prev_seq,
+                        {'restored_this_run': rec.committed,
+                         'directories_this_run': rec.dirs},
+                        mode='catalog',
+                        in_progress=rec.state,
+                        catalog_rec=rec
+                    )
             # Record the terminal condition. EIO near drive-reported EOD is
             # probable EOD only; no fully conclusive classification without
             # original REQUEST SENSE from the failing READ command.
@@ -574,6 +785,22 @@ def recover(args):
             if args.tape and stop_reason=='zero_read_or_filemark_or_eod':
                 rec.log('note',message='zero-length tape read may indicate a filemark, not true EOD')
             if rec.state is not None:
+                if args.catalog_only and stop_reason == 'max_blocks_reached':
+                    checkpoint_write(
+                        checkpoint, source, base, rec.prev_seq,
+                        {'restored_this_run': rec.committed,
+                         'directories_this_run': rec.dirs},
+                        mode='catalog',
+                        in_progress=rec.state,
+                        catalog_rec=rec
+                    )
+                    rec.log(
+                        'intermediate_checkpoint',
+                        begin_seq=rec.state['seq'],
+                        byte_offset=base,
+                        previous_seq=rec.prev_seq,
+                        records=len(rec.state['records'])
+                    )
                 rec.fail_current(f'source stopped ({stop_reason}) before OEND at byte {base}')
             rec.log('source_end',reason=stop_reason,byte_offset=base,
                     last_seen_seq=rec.prev_seq,checkpoint=str(checkpoint),
