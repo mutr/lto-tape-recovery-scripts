@@ -279,28 +279,6 @@ class CatalogRecovery:
           FOREIGN KEY(object_begin_seq) REFERENCES objects(begin_seq)
         );
         CREATE INDEX IF NOT EXISTS idx_records_object ON records(object_begin_seq);
-        CREATE TABLE IF NOT EXISTS inflight_records (
-            object_begin_seq INTEGER NOT NULL,
-            record_idx INTEGER NOT NULL,
-            seq INTEGER NOT NULL,
-            object_seq INTEGER NOT NULL,
-            byte_offset INTEGER NOT NULL,
-            physical_block INTEGER NOT NULL,
-            offset_in_block INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            flag INTEGER NOT NULL,
-            payload_size INTEGER NOT NULL,
-            logical INTEGER NOT NULL,
-            PRIMARY KEY(object_begin_seq,record_idx)
-        );
-        CREATE TABLE IF NOT EXISTS inflight_snapshots (
-            id INTEGER PRIMARY KEY,
-            object_begin_seq INTEGER NOT NULL,
-            record_count INTEGER NOT NULL,
-            byte_offset INTEGER NOT NULL,
-            previous_seq INTEGER NOT NULL,
-            state_json TEXT NOT NULL
-        );
         """)
         self.db.commit()
 
@@ -815,12 +793,162 @@ def recover(args):
             if close: close()
 
 
+
+
+def extract_indexed(args):
+    "Read exactly one indexed Yosemite object (strict, read-only extraction)."
+    if args.resume or args.catalog_only:
+        raise ValueError('--extract-seq cannot be combined with --resume or --catalog-only')
+    if args.catalog is None:
+        raise ValueError('--extract-seq requires --catalog')
+    if not args.catalog.is_file():
+        raise ValueError(f'catalog not found: {args.catalog}')
+    with sqlite3.connect(f'file:{args.catalog.resolve()}?mode=ro', uri=True) as db:
+        row=db.execute('''SELECT begin_seq,end_seq,kind,original_path,size,
+                          begin_offset,end_offset,status,comment,source
+                          FROM objects WHERE begin_seq=?''',(args.extract_seq,)).fetchone()
+        if row is None: raise ValueError(f'begin_seq {args.extract_seq} not found')
+        begin_seq,end_seq,kind,path,expected,begin,end,status,comment,source=row
+        if kind!='file' or status!='placeholder':
+            raise ValueError(f'object status={status}, kind={kind}; only placeholder files are supported')
+        if comment is not None:
+            raise ValueError(f'unsupported/unverified size variant: {comment}')
+        if args.tape and source!=args.tape:
+            raise ValueError(f'catalog source={source!r} does not match tape {args.tape!r}')
+        if begin<0 or end<begin or expected<0:
+            raise ValueError('invalid catalog offsets or size')
+        records=db.execute('''SELECT seq,byte_offset,kind,flag,payload_size,logical
+                  FROM records WHERE object_begin_seq=? ORDER BY byte_offset''',(begin_seq,)).fetchall()
+    if not records or records[0][1]!=begin or records[-1][1]!=end:
+        raise ValueError('incomplete indexed record range')
+    if records[0][2]!='OBGN' or records[-1][2]!='OEND':
+        raise ValueError('object boundary records missing')
+    if records[0][0]!=begin_seq or records[-1][0]!=end_seq:
+        raise ValueError('catalog object sequence mismatch')
+    if len(records)<4:
+        raise ValueError('unexpectedly short object record sequence')
+
+    output=args.out
+    output.mkdir(parents=True,exist_ok=True)
+    name=path.rsplit('/',1)[-1]
+    try: name=safe_part(name)
+    except ValueError: name=f'object-{begin_seq}.bin'
+    # Prefix by sequence to avoid ambiguity between identical names.
+    dest=output/f'{begin_seq}_{name}'
+    partial=output/f'.{begin_seq}_{name}.partial'
+    if dest.exists() or dest.is_symlink() or partial.exists() or partial.is_symlink():
+        raise FileExistsError(f'output already exists: {dest} or {partial}')
+
+    # source_blocks positions at the containing physical block; preserve exact
+    # logical offset independently of the drive's 64KiB physical boundaries.
+    args.max_blocks=max(1,(end//BLOCK - begin//BLOCK)+2+(MAX_DATA//BLOCK))
+    chunks=iter(source_blocks(args,begin))
+    buffer=bytearray()
+    cursor=(begin//BLOCK)*BLOCK
+    skip=begin%BLOCK
+    h=hashlib.sha256()
+    written=0
+    first_content=True
+    metadata_seen=False
+    content_seen=False
+    logical_next=0
+    trailer=bytearray()
+    result=None
+    try:
+        with partial.open('xb') as outf:
+            for index,(seq,offset,kind,flag,payload_size,logical) in enumerate(records):
+                while len(buffer)<HEADER:
+                    try: chunk=next(chunks)
+                    except StopIteration: raise ValueError('source ended before indexed record completed')
+                    if skip: chunk=chunk[skip:];cursor+=skip;skip=0
+                    buffer.extend(chunk)
+                if cursor!=offset:
+                    raise ValueError(f'record offset mismatch: {cursor} != {offset}')
+                hdr=parse_header(buffer)
+                if hdr is None:
+                    raise ValueError(f'invalid Yosemite header at {offset}')
+                needed=HEADER+((hdr['size']+63)//64)*64
+                while len(buffer)<needed:
+                    try: chunk=next(chunks)
+                    except StopIteration: raise ValueError('source ended before indexed record completed')
+                    if skip: chunk=chunk[skip:];cursor+=skip;skip=0
+                    buffer.extend(chunk)
+                if (hdr['seq'],hdr['kind'],hdr['flag'],hdr['size'],hdr['logical'])!=(seq,kind,flag,payload_size,logical):
+                    raise ValueError(f'catalog/tape record disagreement at {offset}')
+                if kind=='DATU' and flag==0:
+                    if content_seen or metadata_seen:
+                        raise ValueError('duplicate or late metadata DATU')
+                    meta=bytes(buffer[HEADER:HEADER+payload_size])
+                    items=extract_path(meta)
+                    if not items or '/'.join(x[1] for x in items)!=path:
+                        raise ValueError('catalog/tape original path mismatch')
+                    metadata_seen=True
+                elif kind=='DATU' and flag==1:
+                    if not metadata_seen: raise ValueError('content before metadata')
+                    raw=memoryview(buffer)[HEADER:HEADER+payload_size]
+                    if first_content:
+                        if logical!=0 or payload_size<40:
+                            raise ValueError('unsupported initial DATU format')
+                        prefix=int.from_bytes(raw[8:12], 'little')+40
+                        if prefix<40 or prefix>payload_size:
+                            raise ValueError(f'invalid DATU metadata prefix: {prefix}')
+                        data=raw[prefix:prefix+min(expected-written,payload_size-prefix)]
+                        trailer.extend(raw[prefix+len(data):])
+                        first_content=False
+                    else:
+                        if logical!=logical_next:
+                            raise ValueError(f'Yosemite logical DATU offset mismatch at {offset}')
+                        n=min(expected-written,payload_size)
+                        data=raw[:n]
+                        trailer.extend(raw[n:])
+                    outf.write(data)
+                    h.update(data)
+                    written+=len(data)
+                    logical_next+=payload_size
+                    content_seen=True
+                    del data,raw
+                elif kind=='OEND':
+                    if not content_seen or not metadata_seen or logical!=expected:
+                        raise ValueError('missing content or OEND size disagreement')
+                elif kind!='OBGN':
+                    raise ValueError(f'unexpected record {kind}')
+                del buffer[:needed]
+                cursor+=needed
+            if written!=expected:
+                raise ValueError(f'extracted size {written} differs from catalog size {expected}')
+            marker=b'$KERNEL.PURGE.DRWEB_HASH_INFO\x00'
+            validation='record headers, offsets, path, size (no original checksum)'
+            if marker in trailer:
+                digest=h.digest()
+                pos=trailer.find(marker)+len(marker)
+                if trailer.find(digest,pos)<0:
+                    raise ValueError('DRWEB_HASH_INFO is present but restored file SHA-256 does not match')
+                validation='record headers, offsets, path, size, tape SHA-256'
+
+            outf.flush();os.fsync(outf.fileno())
+        os.link(partial,dest,follow_symlinks=False)
+        partial.unlink()
+        result=dict(begin_seq=begin_seq, original_path=path, bytes=written,
+                    sha256=h.hexdigest(),output=str(dest),
+                    validation=validation)
+    except (Exception,BaseException):
+        try: partial.unlink(missing_ok=True)
+        except OSError: pass
+        raise
+    finally:
+        close=getattr(chunks,'close',None)
+        if close: close()
+    print(json.dumps(result,ensure_ascii=False,indent=2))
+    return 0
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     group=ap.add_mutually_exclusive_group(required=True)
     group.add_argument('--input',type=Path,help='captured binary file')
     group.add_argument('--tape',help='non-rewinding tape, e.g. /dev/nst0')
     ap.add_argument('--out',required=True,type=Path)
+    ap.add_argument('--extract-seq',type=int,help='extract one verified indexed object by begin_seq')
+    ap.add_argument('--catalog',type=Path,help='SQLite catalog for --extract-seq')
     ap.add_argument('--resume',action='store_true',help='resume at last completed object checkpoint')
     ap.add_argument('--catalog-only',action='store_true',help='create empty placeholder files and SQLite tape index, no payload extraction')
     ap.add_argument('--max-blocks',type=int,default=4096,help='maximum 64KiB tape records per session (default 4096)')
@@ -829,6 +957,10 @@ def main():
         ap.error('tape must be /dev/nstN (not /dev/stN)')
     if args.input and not args.input.is_file(): ap.error('missing capture file')
     try:
+        if args.extract_seq is not None:
+            return extract_indexed(args)
+        if args.catalog is not None:
+            raise ValueError('--catalog is only valid with --extract-seq')
         restored,failed=recover(args)
         print(f'{"Cataloged" if args.catalog_only else "Restored"} {restored} files, incomplete/failed {failed}. Log: {args.out}/recovery.jsonl')
     except (ValueError,FileExistsError,OSError,subprocess.CalledProcessError) as e:
