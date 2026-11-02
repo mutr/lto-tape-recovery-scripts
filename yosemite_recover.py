@@ -809,9 +809,22 @@ def extract_indexed(args):
                           FROM objects WHERE begin_seq=?''',(args.extract_seq,)).fetchone()
         if row is None: raise ValueError(f'begin_seq {args.extract_seq} not found')
         begin_seq,end_seq,kind,path,expected,begin,end,status,comment,source=row
-        if kind!='file' or status!='placeholder':
-            raise ValueError(f'object status={status}, kind={kind}; only placeholder files are supported')
-        if comment is not None:
+        large=False
+        if kind=='file' and status=='unverified' and comment:
+            import json
+            info=json.loads(comment)
+            large=(
+                info.get('estimated_large_size') is True
+                and set(info.get('reasons', [])) == {
+                    'inconsistent size: expected=%s, observed=%s'
+                    % (info.get('oend_logical32'), info.get('measured_datu_bytes')),
+                    'OEND logical is 32-bit; full size unverified'
+                }
+                and info.get('measured_datu_bytes')==expected
+            )
+        if kind!='file' or (status!='placeholder' and not large):
+            raise ValueError(f'object status={status}, kind={kind}; unsupported')
+        if comment is not None and not large:
             raise ValueError(f'unsupported/unverified size variant: {comment}')
         if args.tape and source!=args.tape:
             raise ValueError(f'catalog source={source!r} does not match tape {args.tape!r}')
@@ -827,6 +840,13 @@ def extract_indexed(args):
         raise ValueError('catalog object sequence mismatch')
     if len(records)<4:
         raise ValueError('unexpectedly short object record sequence')
+    if large:
+        content_records=[r for r in records if r[2]=='DATU' and r[3]==1]
+        stream_bytes=sum(r[4] for r in content_records)
+        if (len(content_records)<2 or
+                stream_bytes-240!=expected or
+                any(r[2] not in ('OBGN','DATU','OEND') for r in records)):
+            raise ValueError('large-object catalog structure mismatch')
 
     output=args.out
     output.mkdir(parents=True,exist_ok=True)
@@ -892,6 +912,18 @@ def extract_indexed(args):
                         prefix=int.from_bytes(raw[8:12], 'little')+40
                         if prefix<40 or prefix>payload_size:
                             raise ValueError(f'invalid DATU metadata prefix: {prefix}')
+                        if large:
+                            # Verified Yosemite variant: 84-byte terminal metadata.
+                            oend32=records[-1][5]
+                            candidates=[
+                                (suffix, stream_bytes-prefix-suffix)
+                                for suffix in (0,84)
+                                if stream_bytes-prefix-suffix>4294967295
+                                and (stream_bytes-prefix-suffix)%(2**32)==oend32
+                            ]
+                            if len(candidates)!=1:
+                                raise ValueError('large-object full-size/OEND mismatch')
+                            suffix_size,expected=candidates[0]
                         data=raw[prefix:prefix+min(expected-written,payload_size-prefix)]
                         trailer.extend(raw[prefix+len(data):])
                         first_content=False
@@ -904,11 +936,12 @@ def extract_indexed(args):
                     outf.write(data)
                     h.update(data)
                     written+=len(data)
-                    logical_next+=payload_size
+                    logical_next=(logical_next+payload_size) % 4294967296
                     content_seen=True
                     del data,raw
                 elif kind=='OEND':
-                    if not content_seen or not metadata_seen or logical!=expected:
+                    if (not content_seen or not metadata_seen or
+                            logical!=expected % 4294967296):
                         raise ValueError('missing content or OEND size disagreement')
                 elif kind!='OBGN':
                     raise ValueError(f'unexpected record {kind}')
@@ -916,6 +949,19 @@ def extract_indexed(args):
                 cursor+=needed
             if written!=expected:
                 raise ValueError(f'extracted size {written} differs from catalog size {expected}')
+            if large:
+                expected_signature = bytes.fromhex(
+                    '07000000000000004000000000000000'
+                )
+                if len(trailer)!=suffix_size:
+                    raise ValueError(
+                        f'large-object trailer length mismatch: '
+                        f'{len(trailer)} != {suffix_size}'
+                    )
+                if suffix_size==84 and bytes(trailer[:16])!=expected_signature:
+                    raise ValueError(
+                        'unsupported large-object terminal metadata'
+                    )
             marker=b'$KERNEL.PURGE.DRWEB_HASH_INFO\x00'
             validation='record headers, offsets, path, size (no original checksum)'
             if marker in trailer:
